@@ -4,9 +4,8 @@
 from __future__ import annotations
 
 import argparse
+import gc
 import os
-import socket
-import statistics
 import time
 from typing import Any
 
@@ -14,48 +13,33 @@ import ray
 import torch
 from ray.util.scheduling_strategies import NodeAffinitySchedulingStrategy
 
-
-def positive_int(value: str) -> int:
-    parsed = int(value)
-    if parsed <= 0:
-        raise argparse.ArgumentTypeError("must be greater than zero")
-    return parsed
-
-
-def nonnegative_int(value: str) -> int:
-    parsed = int(value)
-    if parsed < 0:
-        raise argparse.ArgumentTypeError("must be zero or greater")
-    return parsed
-
-
-def identity() -> dict[str, str]:
-    return {
-        "hostname": os.environ.get("SLURMD_NODENAME", socket.gethostname()),
-        "node_id": str(ray.get_runtime_context().get_node_id()),
-    }
+from benchmark_common import (
+    PAYLOAD_EDGE_CHECKSUM,
+    add_transfer_arguments,
+    identity,
+    make_payload,
+    print_result,
+    print_run,
+    select_nodes,
+    transfer_metadata,
+    verify_full_payload,
+    verify_placement,
+    verify_transfer_metadata,
+)
 
 
-# Defining a tensor-transport method fails at import time on older Ray builds.
-# Preserve that error and turn it into a concise image/API diagnostic in main.
+# Defining tensor-transport actors fails at import time on older Ray builds.
 RDT_API_ERROR: Exception | None = None
 try:
     from ray.experimental.collective import create_collective_group
 
-    # Both actors need Ray's private tensor-transport concurrency groups. In
-    # particular, the receiver has no decorated producer method from which Ray
-    # could infer this and would otherwise block its internal receive task.
     @ray.remote(num_cpus=1, num_gpus=1, enable_tensor_transport=True)
     class Sender:
         def __init__(self, nbytes: int) -> None:
-            self.payload = torch.full(
-                (nbytes,), 17, dtype=torch.uint8, device="cuda"
-            )
-            self.payload[-1] = 29
-            torch.cuda.synchronize()
+            self.payload = make_payload(nbytes, torch.device("cuda"))
 
         def info(self) -> dict[str, str]:
-            return identity()
+            return {**identity(), "device": str(self.payload.device)}
 
         @ray.method(tensor_transport="nccl")
         def send(self) -> torch.Tensor:
@@ -64,18 +48,27 @@ try:
 
     @ray.remote(num_cpus=1, num_gpus=1, enable_tensor_transport=True)
     class Receiver:
+        def __init__(self) -> None:
+            self.payload: torch.Tensor | None = None
+
         def info(self) -> dict[str, str]:
-            return identity()
+            return {**identity(), "device": "cuda"}
 
         def receive(self, payload: torch.Tensor) -> dict[str, Any]:
             if not payload.is_cuda:
                 raise RuntimeError("receiver got a CPU tensor instead of CUDA")
-            nbytes = payload.numel() * payload.element_size()
-            checksum = int(payload[0].item()) + int(payload[-1].item())
-            # The driver's timer stops only after this synchronized actor task
-            # has returned, so it includes completion of the NCCL transfer.
-            torch.cuda.synchronize()
-            return {**identity(), "nbytes": nbytes, "checksum": checksum}
+            self.payload = payload
+            return {**identity(), **transfer_metadata(payload)}
+
+        def verify_and_release(self, expected_nbytes: int) -> dict[str, Any]:
+            if self.payload is None:
+                raise RuntimeError("receiver has no payload to verify")
+            payload = self.payload
+            result = verify_full_payload(payload, expected_nbytes, "cuda")
+            self.payload = None
+            del payload
+            gc.collect()
+            return result
 
 except Exception as exc:
     RDT_API_ERROR = exc
@@ -85,11 +78,9 @@ except Exception as exc:
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
-        description="Benchmark a CUDA/Torch Ray Direct Transport NCCL transfer"
+        description="Benchmark a CUDA tensor through Ray Direct Transport/NCCL"
     )
-    parser.add_argument("--size-mb", type=positive_int, default=1024)
-    parser.add_argument("--iterations", type=positive_int, default=5)
-    parser.add_argument("--warmup", type=nonnegative_int, default=1)
+    add_transfer_arguments(parser)
     return parser.parse_args()
 
 
@@ -104,9 +95,8 @@ def require_rdt() -> None:
     if RDT_API_ERROR is not None:
         raise RuntimeError(
             "this image's Ray build lacks the alpha NCCL Ray Direct "
-            "Transport API (ray.method(tensor_transport=...) and "
-            "ray.experimental.collective.create_collective_group); choose "
-            f"a newer IMAGE. Original error: {RDT_API_ERROR}"
+            "Transport API; choose a newer IMAGE. Original error: "
+            f"{RDT_API_ERROR}"
         )
     if not torch.cuda.is_available():
         raise RuntimeError("Torch cannot access CUDA in this container")
@@ -124,8 +114,10 @@ def benchmark(args: argparse.Namespace) -> None:
     )
     require_rdt()
 
-    ray.init(address="auto")
+    initialized = False
     try:
+        ray.init(address="auto")
+        initialized = True
         head, worker = select_nodes()
         nbytes = args.size_mb * 1024 * 1024
         assert Sender is not None and Receiver is not None
@@ -140,8 +132,6 @@ def benchmark(args: argparse.Namespace) -> None:
             )
         ).remote()
 
-        # Actor construction allocates and synchronizes the payload. Metadata
-        # calls ensure that work is complete before collective setup and timing.
         sender_info, receiver_info = ray.get(
             [sender.info.remote(), receiver.info.remote()]
         )
@@ -150,113 +140,57 @@ def benchmark(args: argparse.Namespace) -> None:
         if sender_info["hostname"] == receiver_info["hostname"]:
             raise RuntimeError("sender and receiver unexpectedly share a hostname")
 
-        # NCCL RDT refs can only be consumed by actors in this collective. Keep
-        # the returned group handle alive for the duration of the benchmark.
         try:
             group = create_collective_group([sender, receiver], backend="nccl")
         except Exception as exc:
             raise RuntimeError(
-                "could not create the NCCL RDT collective; verify that the "
-                "selected IMAGE provides Ray's alpha RDT API and NCCL support: "
-                f"{exc}"
+                "could not create the NCCL RDT collective; verify the IMAGE "
+                f"and NCCL configuration: {exc}"
             ) from exc
 
         print(
-            f"Source: {sender_info['hostname']} ({sender_info['node_id']})",
+            f"Source: {sender_info['hostname']} ({sender_info['node_id']}), "
+            f"device={sender_info['device']}",
             flush=True,
         )
         print(
             f"Destination: {receiver_info['hostname']} "
-            f"({receiver_info['node_id']})",
+            f"({receiver_info['node_id']}), device={receiver_info['device']}",
             flush=True,
         )
         print(
             f"Payload: {nbytes} bytes ({args.size_mb} MiB); "
-            "expected checksum: 46",
+            f"expected edge checksum: {PAYLOAD_EDGE_CHECKSUM}",
             flush=True,
         )
 
         rates: list[float] = []
+        durations: list[float] = []
         for run in range(args.warmup + args.iterations):
             start = time.perf_counter()
             tensor_ref = sender.send.remote()
             result_ref = receiver.receive.remote(tensor_ref)
             result = ray.get(result_ref)
             seconds = time.perf_counter() - start
-            verify_result(result, nbytes)
+            verify_transfer_metadata(result, nbytes, "cuda")
 
-            # Never resolve tensor_ref on the driver: NCCL RDT ObjectRefs must
-            # pass directly between actors in their collective group.
+            verification = ray.get(receiver.verify_and_release.remote(nbytes))
+            if not verification["verified"]:
+                raise RuntimeError("receiver did not verify the complete payload")
             del tensor_ref, result_ref
-            if run < args.warmup:
-                print(
-                    f"Warmup {run + 1}: {seconds:.6f} s "
-                    f"({result['nbytes']} bytes, checksum {result['checksum']})",
-                    flush=True,
-                )
-                continue
+            gc.collect()
 
-            gbps = nbytes / seconds / 1e9
-            rates.append(gbps)
-            print(
-                f"Iteration {run - args.warmup + 1}: {seconds:.6f} s, "
-                f"{gbps:.3f} GB/s ({result['nbytes']} bytes, "
-                f"checksum {result['checksum']})",
-                flush=True,
-            )
+            rate = print_run(run, args.warmup, seconds, result["nbytes"])
+            if rate is not None:
+                rates.append(rate)
+                durations.append(seconds)
 
-        median_gbps = statistics.median(rates)
-        print(f"Median: {median_gbps:.3f} GB/s", flush=True)
-        print(
-            f"RESULT benchmark={benchmark_mode} bytes={nbytes} "
-            f"median_GBps={median_gbps:.6f} "
-            f"median_Gbitps={median_gbps * 8:.6f}",
-            flush=True,
-        )
+        print_result(benchmark_mode, nbytes, rates, durations, args.warmup)
         del group
     finally:
-        ray.shutdown()
-
-
-def select_nodes() -> tuple[dict[str, Any], dict[str, Any]]:
-    nodes = [node for node in ray.nodes() if node.get("Alive")]
-    head_id = str(ray.get_runtime_context().get_node_id())
-    head = next(
-        (node for node in nodes if str(node.get("NodeID")) == head_id), None
-    )
-    if head is None:
-        raise RuntimeError("could not identify the Ray head node")
-
-    workers = [node for node in nodes if str(node.get("NodeID")) != head_id]
-    workers.sort(
-        key=lambda node: (
-            str(node.get("NodeManagerHostname", "")),
-            str(node.get("NodeManagerAddress", "")),
-            str(node.get("NodeID", "")),
-        )
-    )
-    if not workers:
-        raise RuntimeError("this benchmark requires at least two alive Ray nodes")
-    return head, workers[0]
-
-
-def verify_placement(info: dict[str, str], expected: str, role: str) -> None:
-    if info["node_id"] != expected:
-        raise RuntimeError(
-            f"{role} placement mismatch: expected node {expected}, "
-            f"got {info['node_id']}"
-        )
-
-
-def verify_result(result: dict[str, Any], nbytes: int) -> None:
-    if result["nbytes"] != nbytes:
-        raise RuntimeError(
-            f"receiver saw {result['nbytes']} bytes; expected {nbytes}"
-        )
-    if result["checksum"] != 46:
-        raise RuntimeError(
-            f"receiver checksum was {result['checksum']}; expected 46"
-        )
+        if initialized:
+            ray.shutdown()
+            print("DRIVER_SHUTDOWN_STATUS=clean", flush=True)
 
 
 if __name__ == "__main__":

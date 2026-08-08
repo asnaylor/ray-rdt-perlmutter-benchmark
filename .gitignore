@@ -1,4 +1,6 @@
 __pycache__/
 *.py[cod]
 *.log
-old/
+local-tests/
+nixl/
+aws-ofi-nccl/

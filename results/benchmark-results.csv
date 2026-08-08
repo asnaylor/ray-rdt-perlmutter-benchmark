@@ -1,0 +1,16 @@
+series,mode,payload,network_selection,size_mib,bytes,warmup,iterations,median_ms,median_GBps,median_Gbitps,source_log
+object,object,cuda,provider not asserted,1,1048576,5,31,7.538905,0.139089,1.112709,ray-object-1MiB-56471587.log
+object,object,cuda,provider not asserted,64,67108864,3,15,140.216176,0.478610,3.828880,ray-object-64MiB-56471587.log
+object,object,cuda,provider not asserted,1024,1073741824,2,7,2125.245035,0.505232,4.041856,ray-object-1024MiB-56471587.log
+rdt-tcp,rdt-tcp,cuda,hsn0,1,1048576,5,31,3.975137,0.263784,2.110269,ray-rdt-tcp-1MiB-56471587.log
+rdt-tcp,rdt-tcp,cuda,hsn0,64,67108864,3,15,37.125564,1.807619,14.460950,ray-rdt-tcp-64MiB-56471587.log
+rdt-tcp,rdt-tcp,cuda,hsn0,1024,1073741824,2,7,550.020781,1.952184,15.617473,ray-rdt-tcp-1024MiB-56471587.log
+rdt-cxi-1,rdt-cxi,cuda,cxi3,1,1048576,5,31,4.167862,0.251586,2.012689,ray-rdt-cxi-1cxi-1MiB-56473492.log
+rdt-cxi-1,rdt-cxi,cuda,cxi3,64,67108864,3,15,7.426225,9.036740,72.293919,ray-rdt-cxi-1cxi-64MiB-56473492.log
+rdt-cxi-1,rdt-cxi,cuda,cxi3,1024,1073741824,2,7,61.021411,17.596149,140.769190,ray-rdt-cxi-1cxi-1024MiB-56473492.log
+rdt-nixl-ucx-tcp-cpu,rdt-nixl-ucx-tcp-cpu,cpu,hsn0,1,1048576,5,31,7.886020,0.132966,1.063732,ray-rdt-nixl-ucx-tcp-cpu-1MiB-56471587.log
+rdt-nixl-ucx-tcp-cpu,rdt-nixl-ucx-tcp-cpu,cpu,hsn0,64,67108864,3,15,60.798536,1.103791,8.830326,ray-rdt-nixl-ucx-tcp-cpu-64MiB-56471587.log
+rdt-nixl-ucx-tcp-cpu,rdt-nixl-ucx-tcp-cpu,cpu,hsn0,1024,1073741824,2,7,1008.753131,1.064425,8.515398,ray-rdt-nixl-ucx-tcp-cpu-1024MiB-56471587.log
+rdt-nixl-cxi-cpu-1,rdt-nixl-cxi-cpu,cpu,cxi3,1,1048576,5,31,7.585999,0.138225,1.105801,ray-rdt-nixl-cxi-cpu-1cxi-1MiB-56471587.log
+rdt-nixl-cxi-cpu-1,rdt-nixl-cxi-cpu,cpu,cxi3,64,67108864,3,15,18.217845,3.683688,29.469507,ray-rdt-nixl-cxi-cpu-1cxi-64MiB-56471587.log
+rdt-nixl-cxi-cpu-1,rdt-nixl-cxi-cpu,cpu,cxi3,1024,1073741824,2,7,178.702600,6.008541,48.068325,ray-rdt-nixl-cxi-cpu-1cxi-1024MiB-56471587.log
