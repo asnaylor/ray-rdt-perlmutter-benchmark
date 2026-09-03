@@ -6,6 +6,8 @@ available in [results/benchmark-results.csv](results/benchmark-results.csv).
 
 ## Headline results
 
+### Best single-NIC configurations
+
 Each flow transferred a 1 GiB tensor. The table reports the best measured
 aggregate throughput within each in-scope single-interface sweep.
 
@@ -16,12 +18,22 @@ aggregate throughput within each in-scope single-interface sweep.
 | GPU | Ray Object Store with host staging | 8 | 0.888 |
 | GPU | NCCL over aws-ofi-nccl/CXI | 1 | 21.700 |
 
-The best measured multi-rail configurations were:
+### Best multi-NIC configurations
 
 | Tensor | Transport | Configuration | Total flows | Median aggregate GB/s |
 |---|---|---|---:|---:|
-| CPU | NIXL, four striped CXI rails | 2 flows per NIC | 8 | 17.272 |
+| CPU | NIXL, four striped CXI rails | Each flow striped over 4 NICs | 8 | 17.272 |
 | GPU | NCCL, four CXI NICs | 1 flow per NIC | 4 | 79.764 |
+
+Here, a rail is a physical CXI NIC/path and a flow is one concurrent
+sender-receiver transfer. NIXL stripes each flow over four rails, whereas NCCL
+uses independent flows pinned to separate NICs.
+
+![Best measured 1 GiB configuration by tensor type](docs/headline-throughput.svg)
+
+The chart compares each transport's fastest tested configuration; the tables
+above give the differing flow and NIC counts. Both panels use the same y-axis
+scale.
 
 NCCL performed best with one flow per NIC: adding concurrent flows to a single
 NIC reduced throughput. Holding that operating point constant and scaling from
@@ -52,7 +64,8 @@ The published matrix contains:
   transport/tensor combinations.
 - 15 single-interface 1 GiB concurrency results: x1/x2/x4/x8 for Object Store
   and NCCL, and x1/x2/x4 for NIXL.
-- Two NIXL four-rail results at one and two flows per NIC.
+- Two NIXL four-rail results at 4 and 8 total flows, with every flow striped
+  across all four NICs.
 - Three NCCL scaling results using one flow per NIC across one, two, and four
   NICs.
 
@@ -96,6 +109,13 @@ All rows below transfer 1 GiB per flow through one network interface.
 
 ![Single-interface throughput by concurrent flow count](docs/single-nic-flow-scaling.svg)
 
+![Single-interface median and p95 latency](docs/single-nic-latency.svg)
+
+The latency figure uses a logarithmic y-axis. Each point transfers 1 GiB per
+flow, so increasing concurrency also increases the total bytes in a batch;
+these are latencies for the configured workloads rather than a fixed batch
+size.
+
 Object Store gained 2.10x on CPU and 1.92x on GPU from x1 to x8. Its x4-to-x8
 gain was only 5.6% on CPU and 7.0% on GPU. Single-interface NIXL gained 86.4%
 from x1 to x4 and delivered 7.89x the best Object Store CPU rate.
@@ -104,30 +124,37 @@ NCCL behaved differently: relative to x1, aggregate throughput fell by 28.1%
 at x2, 72.7% at x4, and 85.2% at x8. Its selected operating point was therefore
 one flow per NIC.
 
-## Multi-rail scaling
+## Multi-NIC scaling
 
-| Tensor | Transport | NICs | Flows per NIC | Total flows | Median ms | p95 ms | Median aggregate GB/s |
-|---|---|---:|---:|---:|---:|---:|---:|
-| CPU | NIXL, striped | 4 | 1 | 4 | 377.458 | 397.485 | 11.379 |
-| CPU | NIXL, striped | 4 | 2 | 8 | 497.341 | 503.379 | 17.272 |
-| GPU | NCCL, GDRDMA | 1 | 1 | 1 | 49.183 | 49.609 | 21.831 |
-| GPU | NCCL, GDRDMA | 2 | 1 | 2 | 51.183 | 52.517 | 41.957 |
-| GPU | NCCL, GDRDMA | 4 | 1 | 4 | 53.846 | 56.481 | 79.764 |
+Every NIXL flow is striped across all four NICs. NCCL instead uses one
+independent flow pinned to each NIC.
 
-![Throughput with multiple CXI rails](docs/multi-nic-scaling.svg)
+| Tensor | Transport | NICs | Total flows | Median ms | p95 ms | Median aggregate GB/s |
+|---|---|---:|---:|---:|---:|---:|
+| CPU | NIXL, striped | 4 | 4 | 377.458 | 397.485 | 11.379 |
+| CPU | NIXL, striped | 4 | 8 | 497.341 | 503.379 | 17.272 |
+| GPU | NCCL, GDRDMA | 1 | 1 | 49.183 | 49.609 | 21.831 |
+| GPU | NCCL, GDRDMA | 2 | 2 | 51.183 | 52.517 | 41.957 |
+| GPU | NCCL, GDRDMA | 4 | 4 | 53.846 | 56.481 | 79.764 |
 
-Each NIXL logical flow was natively striped across all four CXI rails. Moving
-from one to two flows per NIC increased aggregate throughput by 51.8%. NCCL
-used independent NUMA-local GPU flows, one per NIC; two NICs delivered 1.92x
-and four NICs delivered 3.65x the one-NIC aggregate rate.
+![Throughput with multiple CXI NICs](docs/multi-nic-scaling.svg)
+
+![Multi-NIC median and p95 latency](docs/multi-nic-latency.svg)
+
+The latency plot uses total concurrent flows on its x-axis. NIXL holds its NIC
+count at four; NCCL increases its NIC count with its flow count.
+
+Increasing NIXL from four to eight total flows raised aggregate throughput by
+51.8%. For NCCL, two NICs delivered 1.92x and four NICs delivered 3.65x the
+one-NIC aggregate rate.
 
 ## NIXL concurrency limit
 
 Higher NIXL concurrency was tested but is not part of the reported matrix.
-Eight simultaneous flows on one rail and four flows per NIC across four rails
-(16 total) failed during CXI memory registration, including optimized-MR
-PTE-link failures and fi_mr_enable returning ENOSPC. The published results stop
-at the validated lower-concurrency cases.
+Eight simultaneous flows on one rail and 16 total flows across four rails
+failed during CXI memory registration, including optimized-MR
+PTE-link failures and `fi_mr_enable` returning `ENOSPC`. The published results
+stop at the validated lower-concurrency cases.
 
 ## Validation and reproducibility
 

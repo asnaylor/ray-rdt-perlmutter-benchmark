@@ -63,9 +63,12 @@ def parse_args() -> argparse.Namespace:
     publish = subparsers.add_parser("publish")
     publish.add_argument("logs", nargs="+", type=Path)
     publish.add_argument("--csv", type=Path, required=True)
+    publish.add_argument("--headline-svg", type=Path, required=True)
     publish.add_argument("--baseline-svg", type=Path, required=True)
     publish.add_argument("--flows-svg", type=Path, required=True)
+    publish.add_argument("--flows-latency-svg", type=Path, required=True)
     publish.add_argument("--nics-svg", type=Path, required=True)
+    publish.add_argument("--nics-latency-svg", type=Path, required=True)
     return parser.parse_args()
 
 
@@ -1068,6 +1071,58 @@ def save_figure(fig: Any, path: Path) -> None:
     os.replace(temporary, path)
 
 
+def plot_headline(rows: list[dict[str, Any]], path: Path) -> None:
+    plt = plot_setup()
+    fig, axes = plt.subplots(1, 2, figsize=(10.5, 4.3), sharey=True)
+    try:
+        global_maximum = 0.0
+        for axis, device, title in zip(
+            axes, ("cpu", "gpu"), ("CPU tensors", "GPU tensors"), strict=True
+        ):
+            series = [item for item in SERIES if item[1] == device]
+            selected = []
+            for transport, series_device in series:
+                candidates = [
+                    row
+                    for row in rows
+                    if row["transport"] == transport
+                    and row["device"] == series_device
+                    and int(row["size_mib"]) == 1024
+                    and row["suite"] in {"single-nic", "four-rail", "multi-nic"}
+                ]
+                selected.append(
+                    max(candidates, key=lambda row: float(row["median_aggregate_GBps"]))
+                )
+
+            values = [float(row["median_aggregate_GBps"]) for row in selected]
+            labels = [
+                "Object Store"
+                if row["transport"] == "object"
+                else row["transport"].upper()
+                for row in selected
+            ]
+            colors = [COLORS[row["transport"]] for row in selected]
+            bars = axis.bar(labels, values, color=colors, width=0.6)
+            maximum = max(values)
+            global_maximum = max(global_maximum, maximum)
+            axis.set_title(title)
+            axis.grid(True, axis="y", color="#dddddd")
+            axis.set_axisbelow(True)
+            axis.bar_label(
+                bars,
+                labels=[f"{value:.3f}" for value in values],
+                padding=3,
+                fontsize=9,
+            )
+        axes[0].set_ylim(0, global_maximum * 1.18)
+        fig.suptitle("Best measured 1 GiB configuration")
+        fig.supylabel("Median aggregate throughput (GB/s)")
+        fig.tight_layout()
+        save_figure(fig, path)
+    finally:
+        plt.close(fig)
+
+
 def plot_two_panels(
     rows: list[dict[str, Any]], suite: str, x_field: str, path: Path
 ) -> None:
@@ -1115,6 +1170,100 @@ def plot_two_panels(
         plt.close(fig)
 
 
+def plot_latency_series(
+    axis: Any,
+    rows: list[dict[str, Any]],
+    transport: str,
+    x_field: str,
+) -> None:
+    selected = [row for row in rows if row["transport"] == transport]
+    selected.sort(key=lambda row: int(row[x_field]))
+    label = LABELS[(transport, selected[0]["device"])]
+    x_values = [int(row[x_field]) for row in selected]
+    axis.plot(
+        x_values,
+        [float(row["median_ms"]) for row in selected],
+        marker="o",
+        linewidth=2,
+        color=COLORS[transport],
+        label=f"{label} median",
+    )
+    axis.plot(
+        x_values,
+        [float(row["p95_ms"]) for row in selected],
+        marker="^",
+        linewidth=1.5,
+        linestyle="--",
+        color=COLORS[transport],
+        label=f"{label} p95",
+    )
+
+
+def plot_single_nic_latency(rows: list[dict[str, Any]], path: Path) -> None:
+    plt = plot_setup()
+    fig, axes = plt.subplots(1, 2, figsize=(10.5, 4.3), sharey=True)
+    try:
+        for axis, device, title in zip(
+            axes, ("cpu", "gpu"), ("CPU tensors", "GPU tensors"), strict=True
+        ):
+            selected = [
+                row
+                for row in rows
+                if row["suite"] == "single-nic" and row["device"] == device
+            ]
+            for transport, series_device in SERIES:
+                if series_device == device:
+                    plot_latency_series(axis, selected, transport, "flows_per_nic")
+            axis.set_title(title)
+            axis.set_xscale("log", base=2)
+            axis.set_yscale("log")
+            axis.set_xticks(FLOW_COUNTS, tuple(str(item) for item in FLOW_COUNTS))
+            axis.grid(True, color="#dddddd")
+            axis.legend(frameon=False, fontsize=8)
+        axes[0].set_ylabel("Batch latency (ms, log scale)")
+        fig.supxlabel("Concurrent 1 GiB flows through one interface")
+        fig.tight_layout()
+        save_figure(fig, path)
+    finally:
+        plt.close(fig)
+
+
+def plot_multi_nic_latency(rows: list[dict[str, Any]], path: Path) -> None:
+    plt = plot_setup()
+    fig, axes = plt.subplots(1, 2, figsize=(10.5, 4.3), sharey=True)
+    try:
+        nixl_rows = [
+            row
+            for row in rows
+            if row["suite"] == "four-rail" and row["transport"] == "nixl"
+        ]
+        plot_latency_series(axes[0], nixl_rows, "nixl", "total_flows")
+        axes[0].set_title("NIXL CPU: 4 striped NICs")
+        axes[0].set_xscale("log", base=2)
+        axes[0].set_xticks((4, 8), ("4", "8"))
+
+        nccl_rows = [
+            row
+            for row in rows
+            if row["suite"] == "multi-nic" and row["transport"] == "nccl"
+        ]
+        plot_latency_series(axes[1], nccl_rows, "nccl", "total_flows")
+        axes[1].set_title("NCCL GPU: 1 flow per NIC")
+        axes[1].set_xscale("log", base=2)
+        axes[1].set_xticks((1, 2, 4), ("1", "2", "4"))
+
+        for axis in axes:
+            axis.set_yscale("log")
+            axis.grid(True, color="#dddddd")
+            axis.legend(frameon=False, fontsize=8)
+        axes[0].set_ylabel("Batch latency (ms, log scale)")
+        fig.supxlabel("Total concurrent 1 GiB flows")
+        fig.tight_layout()
+        save_figure(fig, path)
+    finally:
+        plt.close(fig)
+
+
 def plot_multi_nic(rows: list[dict[str, Any]], path: Path) -> None:
     plt = plot_setup()
     fig, axes = plt.subplots(1, 2, figsize=(10.5, 4.3), sharey=True)
@@ -1124,9 +1273,9 @@ def plot_multi_nic(rows: list[dict[str, Any]], path: Path) -> None:
             for row in rows
             if row["suite"] == "four-rail" and row["transport"] == "nixl"
         ]
-        nixl_rows.sort(key=lambda row: int(row["flows_per_nic"]))
+        nixl_rows.sort(key=lambda row: int(row["total_flows"]))
         axes[0].plot(
-            [int(row["flows_per_nic"]) for row in nixl_rows],
+            [int(row["total_flows"]) for row in nixl_rows],
             [float(row["median_aggregate_GBps"]) for row in nixl_rows],
             marker="o",
             linewidth=2,
@@ -1134,8 +1283,8 @@ def plot_multi_nic(rows: list[dict[str, Any]], path: Path) -> None:
             label="4 striped rails",
         )
         axes[0].set_title("NIXL CPU")
-        axes[0].set_xlabel("1 GiB flows per NIC")
-        axes[0].set_xticks(NIXL_FOUR_RAIL_FLOW_COUNTS)
+        axes[0].set_xlabel("Total concurrent 1 GiB flows")
+        axes[0].set_xticks((4, 8))
 
         nccl_rows = [
             row
@@ -1144,13 +1293,14 @@ def plot_multi_nic(rows: list[dict[str, Any]], path: Path) -> None:
         ]
         nccl_rows.sort(key=lambda row: int(row["nic_count"]))
         nccl_fpn = nccl_rows[0]["flows_per_nic"]
+        flow_word = "flow" if int(nccl_fpn) == 1 else "flows"
         axes[1].plot(
             [int(row["nic_count"]) for row in nccl_rows],
             [float(row["median_aggregate_GBps"]) for row in nccl_rows],
             marker="o",
             linewidth=2,
             color=COLORS["nccl"],
-            label=f"{nccl_fpn} flows/NIC",
+            label=f"{nccl_fpn} {flow_word}/NIC",
         )
         axes[1].set_title("NCCL GPU")
         axes[1].set_xlabel("CXI NICs")
@@ -1170,9 +1320,12 @@ def publish(args: argparse.Namespace) -> None:
     rows = load_matrix(args.logs)
     final_paths = (
         args.csv,
+        args.headline_svg,
         args.baseline_svg,
         args.flows_svg,
+        args.flows_latency_svg,
         args.nics_svg,
+        args.nics_latency_svg,
     )
     if len({path.resolve() for path in final_paths}) != len(final_paths):
         raise ResultError("canonical output paths must be distinct")
@@ -1180,9 +1333,12 @@ def publish(args: argparse.Namespace) -> None:
     try:
         staged_paths.extend(create_staged_path(path) for path in final_paths)
         write_csv(rows, staged_paths[0])
-        plot_two_panels(rows, "baseline", "size_mib", staged_paths[1])
-        plot_two_panels(rows, "single-nic", "flows_per_nic", staged_paths[2])
-        plot_multi_nic(rows, staged_paths[3])
+        plot_two_panels(rows, "baseline", "size_mib", staged_paths[2])
+        plot_headline(rows, staged_paths[1])
+        plot_two_panels(rows, "single-nic", "flows_per_nic", staged_paths[3])
+        plot_single_nic_latency(rows, staged_paths[4])
+        plot_multi_nic(rows, staged_paths[5])
+        plot_multi_nic_latency(rows, staged_paths[6])
         for staged, final in zip(staged_paths, final_paths, strict=True):
             os.replace(staged, final)
     finally:
@@ -1192,9 +1348,12 @@ def publish(args: argparse.Namespace) -> None:
             except FileNotFoundError:
                 pass
     print(f"ARTIFACT kind=csv path={args.csv} records={len(rows)}")
+    print(f"ARTIFACT kind=headline-svg path={args.headline_svg}")
     print(f"ARTIFACT kind=baseline-svg path={args.baseline_svg}")
     print(f"ARTIFACT kind=flows-svg path={args.flows_svg}")
+    print(f"ARTIFACT kind=flows-latency-svg path={args.flows_latency_svg}")
     print(f"ARTIFACT kind=nics-svg path={args.nics_svg}")
+    print(f"ARTIFACT kind=nics-latency-svg path={args.nics_latency_svg}")
 
 
 def main() -> None:

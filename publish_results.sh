@@ -48,7 +48,10 @@ done
 podman-hpc run --rm -v "${WORKDIR}:/workdir" -w /workdir "${IMAGE}" \
   python -u /workdir/plot_benchmark_results.py publish \
   --csv /workdir/results/benchmark-results.csv \
+  --headline-svg /workdir/docs/headline-throughput.svg \
   --baseline-svg /workdir/docs/baseline-throughput.svg \
   --flows-svg /workdir/docs/single-nic-flow-scaling.svg \
+  --flows-latency-svg /workdir/docs/single-nic-latency.svg \
   --nics-svg /workdir/docs/multi-nic-scaling.svg \
+  --nics-latency-svg /workdir/docs/multi-nic-latency.svg \
   "${container_logs[@]}"

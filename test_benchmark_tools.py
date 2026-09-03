@@ -745,18 +745,24 @@ class PublicationTests(unittest.TestCase):
             root = Path(directory)
             outputs = [
                 root / "results.csv",
+                root / "headline.svg",
                 root / "baseline.svg",
                 root / "flows.svg",
+                root / "flows-latency.svg",
                 root / "nics.svg",
+                root / "nics-latency.svg",
             ]
             for output in outputs:
                 output.write_text("original\n", encoding="utf-8")
             args = argparse.Namespace(
                 logs=[],
                 csv=outputs[0],
-                baseline_svg=outputs[1],
-                flows_svg=outputs[2],
-                nics_svg=outputs[3],
+                headline_svg=outputs[1],
+                baseline_svg=outputs[2],
+                flows_svg=outputs[3],
+                flows_latency_svg=outputs[4],
+                nics_svg=outputs[5],
+                nics_latency_svg=outputs[6],
             )
             original_load_matrix = publisher.load_matrix
             original_plot_two_panels = publisher.plot_two_panels
