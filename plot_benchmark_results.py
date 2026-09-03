@@ -16,7 +16,7 @@ from typing import Any
 SIZES_MIB = (1, 64, 1024)
 FLOW_COUNTS = (1, 2, 4, 8)
 NIXL_FLOW_COUNTS = (1, 2, 4)
-NIXL_FOUR_RAIL_FLOW_COUNTS = (1, 2)
+NIXL_FOUR_RAIL_TOTAL_FLOWS = (4, 8)
 DEFAULT_WARMUPS = 3
 DEFAULT_ITERATIONS = 10
 SERIES = (
@@ -42,6 +42,9 @@ TRANSPORT_DEVICES = {
     "nixl": ("cxi3", "cxi2", "cxi1", "cxi0"),
     "nccl": ("cxi3", "cxi2", "cxi1", "cxi0"),
 }
+# Current launchers do not produce these cases, but the five source logs for the
+# published dataset do. Keep this exact allowlist so those logs remain
+# reproducible without accepting arbitrary out-of-scope results.
 LEGACY_OUT_OF_SCOPE_CASES = frozenset(
     {
         "object-cpu-single-nic-1024mib-16f",
@@ -928,8 +931,8 @@ def load_matrix(paths: list[Path]) -> list[dict[str, Any]]:
         for flows in FLOW_COUNTS_BY_SERIES[(transport, device)]
     }
     expected_nixl_four_rail = {
-        ("nixl", "cpu", "four-rail", 1024, 4, flows)
-        for flows in NIXL_FOUR_RAIL_FLOW_COUNTS
+        ("nixl", "cpu", "four-rail", 1024, 4, total_flows // 4)
+        for total_flows in NIXL_FOUR_RAIL_TOTAL_FLOWS
     }
     nccl_operating_point = operating_points[("nccl", "gpu")]
     expected_nccl_multi_nic = {
@@ -1016,13 +1019,6 @@ def write_csv(rows: list[dict[str, Any]], path: Path) -> None:
         writer.writeheader()
         for row in rows:
             writer.writerow({name: row.get(name, "") for name in CSV_FIELDS})
-
-
-def atomic_csv(rows: list[dict[str, Any]], path: Path) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True)
-    temporary = path.with_suffix(path.suffix + ".tmp")
-    write_csv(rows, temporary)
-    os.replace(temporary, path)
 
 
 def create_staged_path(path: Path) -> Path:

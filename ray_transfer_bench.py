@@ -17,7 +17,6 @@ from benchmark_common import (
     FLOW_COUNTS,
     MIB,
     actor_affinity,
-    choose_operating_point,
     cleanup_actors,
     cpu_actor_options,
     create_gpu_group,
@@ -33,6 +32,7 @@ from benchmark_common import (
     validate_hsn0,
     verify_full_payload,
 )
+from benchmark_stats import choose_operating_point
 
 
 @ray.remote

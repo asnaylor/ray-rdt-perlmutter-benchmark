@@ -21,7 +21,6 @@ from benchmark_common import (
     FLOW_COUNTS,
     MIB,
     actor_affinity,
-    choose_operating_point,
     cleanup_actors,
     create_gpu_group,
     emit_path,
@@ -36,6 +35,7 @@ from benchmark_common import (
     validate_hsn0,
     verify_full_payload,
 )
+from benchmark_stats import choose_operating_point
 
 
 RDT_API_ERROR: Exception | None = None

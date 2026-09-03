@@ -12,8 +12,6 @@ IMAGE=""
 PROFILE=full
 TRANSPORT=""
 VERBOSE=0
-NIXL_DEVICE=""
-NIXL_STANDARD_MRS=0
 NIXL_RAILS=""
 NCCL_SUITE=""
 NCCL_FLOWS_PER_NIC=""
@@ -32,15 +30,6 @@ while (( $# )); do
       (( $# >= 2 )) || die "--transport requires a value"
       TRANSPORT="$2"
       shift 2
-      ;;
-    --nixl-device)
-      (( $# >= 2 )) || die "--nixl-device requires a value"
-      NIXL_DEVICE="$2"
-      shift 2
-      ;;
-    --nixl-standard-mrs)
-      NIXL_STANDARD_MRS=1
-      shift
       ;;
     --nixl-rails)
       (( $# >= 2 )) || die "--nixl-rails requires a value"
@@ -62,7 +51,7 @@ while (( $# )); do
       shift
       ;;
     -h|--help)
-      echo "Usage: $0 --image IMAGE --transport object|nixl|nccl [--smoke] [--nixl-rails 1|4] [--nixl-standard-mrs] [--nixl-device cxiN] [--nccl-suite sweep|scaling] [--nccl-flows-per-nic N] [--verbose]"
+      echo "Usage: $0 --image IMAGE --transport object|nixl|nccl [--smoke] [--nixl-rails 1|4] [--nccl-suite sweep|scaling] [--nccl-flows-per-nic N] [--verbose]"
       exit 0
       ;;
     *)
@@ -120,15 +109,6 @@ if [[ "${TRANSPORT}" == "nccl" && "${PROFILE}" == "smoke" ]]; then
   [[ -z "${NCCL_SUITE}" && -z "${NCCL_FLOWS_PER_NIC}" ]] \
     || die "NCCL smoke does not accept suite or flow-count options"
 fi
-if [[ -n "${NIXL_DEVICE}" ]]; then
-  [[ "${NIXL_DEVICE}" =~ ^cxi[0-3]$ ]] \
-    || die "--nixl-device must be one of cxi0, cxi1, cxi2, or cxi3"
-  [[ "${TRANSPORT}" == "nixl" && "${PROFILE}" == "smoke" ]] \
-    || die "--nixl-device requires --transport nixl --smoke"
-fi
-(( NIXL_STANDARD_MRS == 0 )) \
-  || [[ "${TRANSPORT}" == "nixl" ]] \
-  || die "--nixl-standard-mrs requires a NIXL transport run"
 [[ -n "${SLURM_JOB_ID:-}" ]] || die "run inside a Slurm allocation"
 [[ -n "${SLURM_JOB_NODELIST:-}" ]] || die "SLURM_JOB_NODELIST is not set"
 for command_name in scontrol srun podman-hpc timeout tee tail; do
@@ -280,14 +260,11 @@ run_session() {
       --env "FI_MR_CACHE_MAX_COUNT=1"
       --env "NIXL_LOG_LEVEL=DEBUG"
     )
-    if (( NIXL_STANDARD_MRS )) || [[ "${NIXL_RAILS}" == "4" ]]; then
-      podman_args+=(--env "FI_CXI_OPTIMIZED_MRS=false")
-    fi
     if [[ "${NIXL_RAILS}" == "4" ]]; then
-      podman_args+=(--env "NIXL_LIBFABRIC_MAX_BW_PER_DRAM_SEG=1000")
-    fi
-    if [[ -n "${NIXL_DEVICE}" ]]; then
-      podman_args+=(--env "RAY_BENCH_NIXL_DEVICE=${NIXL_DEVICE}")
+      podman_args+=(
+        --env "FI_CXI_OPTIMIZED_MRS=false"
+        --env "NIXL_LIBFABRIC_MAX_BW_PER_DRAM_SEG=1000"
+      )
     fi
   elif [[ "${transport}" == "nccl" ]]; then
     podman_args+=(

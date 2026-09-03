@@ -7,6 +7,15 @@ Ray Direct Transport (RDT) over NCCL and NIXL.
 This is a point-to-point transport benchmark. It is not an all-reduce, DDP,
 training-throughput, or MPI benchmark.
 
+## Terminology
+
+| Term | Meaning |
+|---|---|
+| Flow | One independent sender-to-receiver tensor transfer. xN means N actor pairs transfer concurrently. |
+| Batch | One transfer on every active flow; batch latency ends when all flows complete. |
+| Rail | One physical CXI NIC/path. NIXL can stripe one flow across four rails; NCCL pins each flow to one rail. |
+| Aggregate throughput | Total bytes transferred by every flow divided by batch duration. |
+
 ## Supported matrix
 
 | Tensor path | Ray Object Store | NCCL RDT | NIXL RDT |
@@ -42,11 +51,6 @@ rates within the in-scope single-interface sweeps:
 |---|---|---|---:|---:|
 | CPU | NIXL, four striped CXI rails | Each flow striped over 4 NICs | 8 | 17.272 |
 | GPU | NCCL, four CXI NICs | 1 flow per NIC | 4 | 79.764 |
-
-Here, a **rail** is a physical CXI NIC/path and a **flow** is one concurrent
-sender-receiver transfer. Multi-rail does not simply mean multiple flows: NIXL
-stripes each flow across all four rails, while NCCL uses independent flows
-pinned to separate NICs.
 
 ![Best measured 1 GiB configuration by tensor type](docs/headline-throughput.svg)
 
@@ -148,7 +152,7 @@ Use `--smoke` for a quick transport check.
 
 See [transport configuration](docs/transport-configuration.md) for device
 exposure, topology and affinity, environment settings, session-isolation
-requirements, verbose logging, and the independent NIXL multi-rail probe.
+requirements, and known pitfalls.
 
 ## Publish results
 

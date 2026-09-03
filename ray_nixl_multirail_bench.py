@@ -44,7 +44,7 @@ from ray_nixl_bench import (
 
 EXPECTED_MAX_BW_PER_DRAM_SEG = "1000"
 STANDARD_MR_VALUES = {"0", "false"}
-FOUR_RAIL_FLOWS_PER_NIC = (1, 2)
+FOUR_RAIL_TOTAL_FLOWS = (4, 8)
 
 
 def selected_devices() -> tuple[str, ...]:
@@ -253,11 +253,13 @@ def validate_and_emit_affinity(
     )
 
 
-def run_case(pool: NixlMultirailActorPool, flows_per_nic: int) -> Any:
+def run_case(pool: NixlMultirailActorPool, total_flows: int) -> Any:
     size_mib = 1024
     nbytes = size_mib * MIB
     nic_count = len(CXI_DEVICES)
-    total_flows = nic_count * flows_per_nic
+    if total_flows % nic_count:
+        raise RuntimeError("striped NIXL flow count must divide across four NICs")
+    flows_per_nic = total_flows // nic_count
     case_id = f"nixl-cpu-four-rail-{size_mib}mib-4n-{flows_per_nic}fpn"
     print(
         f"RUN case={case_id} suite=four-rail transport=nixl device=cpu "
@@ -362,8 +364,8 @@ def benchmark() -> None:
         head, worker = select_nodes()
         validate_hsn0(head, worker)
         pool = NixlMultirailActorPool(head, worker)
-        for flows_per_nic in FOUR_RAIL_FLOWS_PER_NIC:
-            run_case(pool, flows_per_nic)
+        for total_flows in FOUR_RAIL_TOTAL_FLOWS:
+            run_case(pool, total_flows)
     finally:
         if pool is not None:
             retained = pool.actor_count()

@@ -41,11 +41,13 @@ with:
 ```text
 FI_CXI_DEVICE_NAME=cxi3,cxi2,cxi1,cxi0
 FI_CXI_OPTIMIZED_MRS=false
+NIXL_LIBFABRIC_MAX_BW_PER_DRAM_SEG=1000
 ```
 
 Every four-rail NIXL flow is striped across all four NICs. Standard memory
 regions are required because optimized registration failed on this path. The
-one-entry MR cache and reusable actor pool bound retained CXI registrations.
+bandwidth ceiling allows NIXL to select multiple rails; the one-entry MR cache
+and reusable actor pool bound retained CXI registrations.
 
 NCCL uses independent flows pinned to one NIC each:
 
@@ -75,5 +77,4 @@ workaround variables before Ray starts.
   structured result and shutdown evidence rather than launcher noise.
 
 Use `--smoke` for a quick transport check and `--verbose` for complete Ray and
-library output. `run_nixl_native_multirail_test.sh` provides an independent
-four-rail diagnostic; it does not contribute to the published result matrix.
+library output.

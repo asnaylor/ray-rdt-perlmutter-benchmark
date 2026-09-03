@@ -18,7 +18,7 @@ from ray.util.scheduling_strategies import (
     PlacementGroupSchedulingStrategy,
 )
 
-from benchmark_stats import Measurements, choose_operating_point, summarize
+from benchmark_stats import Measurements, summarize
 
 
 MIB = 1024 * 1024

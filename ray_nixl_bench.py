@@ -93,7 +93,6 @@ from benchmark_common import (  # noqa: E402
     DEFAULT_WARMUPS,
     MIB,
     actor_affinity,
-    choose_operating_point,
     cleanup_actors,
     cpu_actor_options,
     emit_path,
@@ -107,16 +106,11 @@ from benchmark_common import (  # noqa: E402
     validate_hsn0,
     verify_full_payload,
 )
+from benchmark_stats import choose_operating_point  # noqa: E402
 
 
-DEFAULT_NIXL_CXI_DEVICES = ("cxi3", "cxi2", "cxi1", "cxi0")
 NIXL_FLOW_COUNTS = (1, 2, 4)
-preferred_device = os.environ.get("RAY_BENCH_NIXL_DEVICE")
-NIXL_CXI_DEVICES = (
-    (preferred_device,)
-    if preferred_device is not None
-    else DEFAULT_NIXL_CXI_DEVICES
-)
+NIXL_CXI_DEVICE = "cxi3"
 
 
 def initialize_transport(affinity: dict[str, Any]) -> dict[str, Any]:
@@ -231,12 +225,8 @@ def require_environment() -> None:
         )
 
 
-def rails_for_case(nic_count: int, flows_per_nic: int) -> list[str]:
-    return [
-        rail
-        for rail in NIXL_CXI_DEVICES[:nic_count]
-        for _ in range(flows_per_nic)
-    ]
+def rails_for_case(flow_count: int) -> list[str]:
+    return [NIXL_CXI_DEVICE] * flow_count
 
 
 class NixlActorPool:
@@ -321,21 +311,21 @@ def run_case(
     pool: NixlActorPool,
     suite: str,
     size_mib: int,
-    nic_count: int,
-    flows_per_nic: int,
+    flow_count: int,
     warmups: int,
     iterations: int,
 ) -> Any:
-    rails = rails_for_case(nic_count, flows_per_nic)
+    nic_count = 1
+    rails = rails_for_case(flow_count)
     total_flows = len(rails)
     case_id = (
         f"nixl-cpu-{suite}-{size_mib}mib-{nic_count}n-"
-        f"{flows_per_nic}fpn"
+        f"{flow_count}fpn"
     )
     print(
         f"RUN case={case_id} suite={suite} transport=nixl device=cpu "
         f"size_mib={size_mib} nic_count={nic_count} "
-        f"flows_per_nic={flows_per_nic} total_flows={total_flows}",
+        f"flows_per_nic={flow_count} total_flows={total_flows}",
         flush=True,
     )
     emit_path(
@@ -345,7 +335,7 @@ def run_case(
         "cxi",
         "libfabric",
         nic_count,
-        NIXL_CXI_DEVICES[:nic_count],
+        (NIXL_CXI_DEVICE,),
         backend="LIBFABRIC",
         rail_policy="pinned",
         ray_control="hsn0",
@@ -383,7 +373,7 @@ def run_case(
         "cpu",
         size_mib,
         nic_count,
-        flows_per_nic,
+        flow_count,
         total_flows,
         warmups,
         iterations,
@@ -417,14 +407,13 @@ def benchmark(profile: str) -> None:
         validate_hsn0(head, worker)
         pool = NixlActorPool(head, worker)
         if profile == "smoke":
-            run_case(pool, "smoke", 1, 1, 1, 1, 1)
+            run_case(pool, "smoke", 1, 1, 1, 1)
         else:
             for size_mib in BASELINE_SIZES_MIB:
                 run_case(
                     pool,
                     "baseline",
                     size_mib,
-                    1,
                     1,
                     DEFAULT_WARMUPS,
                     DEFAULT_ITERATIONS,
@@ -434,7 +423,6 @@ def benchmark(profile: str) -> None:
                     pool,
                     "single-nic",
                     1024,
-                    1,
                     flows,
                     DEFAULT_WARMUPS,
                     DEFAULT_ITERATIONS,

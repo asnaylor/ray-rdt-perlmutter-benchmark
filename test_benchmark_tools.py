@@ -17,16 +17,16 @@ from benchmark_stats import (
 )
 from plot_benchmark_results import (
     ResultError,
-    atomic_csv,
     load_matrix,
     validate_transport_log,
+    write_csv,
 )
 
 
 SIZES_MIB = (1, 64, 1024)
 FLOW_COUNTS = (1, 2, 4, 8)
 NIXL_FLOW_COUNTS = (1, 2, 4)
-NIXL_FOUR_RAIL_FLOW_COUNTS = (1, 2)
+NIXL_FOUR_RAIL_TOTAL_FLOWS = (4, 8)
 TRANSPORT_SERIES = {
     "object": (("object", "cpu"), ("object", "gpu")),
     "nixl": (("nixl", "cpu"),),
@@ -173,7 +173,8 @@ def write_matrix(directory: Path, bad_operating_point: bool = False) -> list[Pat
                 f"STACK transport={transport} ray=2.54.0 torch=2.10.0 "
                 "cuda=13.0"
                 + (
-                    " nixl=1.3.2 cxi_optimized_mrs=false "
+                    " nixl=1.3.2 cxi_optimized_mrs="
+                    f"{'false' if rail_policy == 'striped' else 'unset'} "
                     f"cxi_mr_cache_max_count=1 rail_policy={rail_policy}"
                     + (
                         " max_bw_per_dram_seg=1000"
@@ -310,7 +311,8 @@ def write_matrix(directory: Path, bad_operating_point: bool = False) -> list[Pat
             "use_striping=true",
         )
     )
-    for flows in NIXL_FOUR_RAIL_FLOW_COUNTS:
+    for total_flows in NIXL_FOUR_RAIL_TOTAL_FLOWS:
+        flows_per_nic = total_flows // 4
         lines.extend(
             case_records(
                 "nixl",
@@ -318,8 +320,8 @@ def write_matrix(directory: Path, bad_operating_point: bool = False) -> list[Pat
                 "four-rail",
                 1024,
                 4,
-                flows,
-                pool_retained=2 * 4 * flows,
+                flows_per_nic,
+                pool_retained=2 * total_flows,
             )
         )
     lines.extend(
@@ -436,16 +438,14 @@ class PublicationTests(unittest.TestCase):
         with self.assertRaises(ResultError):
             load_matrix([])
 
-    def test_csv_replaces_an_existing_artifact(self) -> None:
+    def test_csv_schema(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             output = Path(directory) / "result.csv"
-            output.write_text("stale\n", encoding="utf-8")
-            atomic_csv([], output)
+            write_csv([], output)
             self.assertTrue(output.read_text(encoding="utf-8").startswith("case,"))
             header = output.read_text(encoding="utf-8").splitlines()[0]
             self.assertNotIn("run_id", header)
             self.assertNotIn("source_log", header)
-            self.assertFalse(output.with_suffix(".csv.tmp").exists())
 
     def test_complete_32_result_matrix_is_accepted(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -455,7 +455,20 @@ class PublicationTests(unittest.TestCase):
             nixl_rows = [row for row in rows if row["transport"] == "nixl"]
             self.assertEqual(len(nixl_rows), 8)
             self.assertEqual(
-                {row["cxi_optimized_mrs"] for row in nixl_rows}, {"false"}
+                {
+                    row["cxi_optimized_mrs"]
+                    for row in nixl_rows
+                    if row["suite"] == "four-rail"
+                },
+                {"false"},
+            )
+            self.assertEqual(
+                {
+                    row["cxi_optimized_mrs"]
+                    for row in nixl_rows
+                    if row["suite"] != "four-rail"
+                },
+                {"unset"},
             )
             self.assertEqual(
                 {row["cxi_mr_cache_max_count"] for row in nixl_rows}, {"1"}
