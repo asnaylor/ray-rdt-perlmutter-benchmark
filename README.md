@@ -1,237 +1,314 @@
-# Ray transfer benchmarks on Perlmutter
+# Ray tensor transport on Perlmutter
 
-This repository compares one-way PyTorch tensor transfers between Ray actors
-on two NERSC Perlmutter nodes using either the Ray Object Store or Ray Direct
-Transport (RDT). The RDT modes use NCCL or NIXL over TCP or native CXI. Every
-run verifies the complete payload; RDT runs also validate their
-backend/provider from runtime logs, while the Object Store's low-level provider
-is not asserted. This is a point-to-point, single-tensor microbenchmark, not a
-measurement of DDP, all-reduce, multi-GPU scaling, or training throughput.
+This repository measures one-way tensor transfers between two Ray actors on
+different Perlmutter GPU nodes. It compares Ray's TCP Object Store path with
+Ray Direct Transport (RDT) over NCCL and NIXL.
 
-## Benchmark modes
+This is a point-to-point transport benchmark. It is not an all-reduce, DDP,
+training-throughput, or MPI benchmark.
 
-| Mode | Payload | Measured transfer path |
-|---|---|---|
-| `object` | CUDA → CUDA | Ray Object Store (`ObjectRef`); the low-level network provider is not asserted |
-| `rdt-tcp` (NCCL) | CUDA → CUDA | Ray Direct Transport (RDT) → NCCL → AWS OFI NCCL → libfabric `tcp` on `hsn0` |
-| `rdt-cxi` (NCCL) | CUDA → CUDA | Ray RDT → NCCL → AWS OFI NCCL → libfabric `cxi3` → Slingshot 11 |
-| `rdt-nixl-cxi-cpu` | CPU → CPU | Ray RDT → NIXL `LIBFABRIC` → libfabric `cxi3` → Slingshot 11 |
-| `rdt-nixl-ucx-tcp-cpu` | CPU → CPU | Ray RDT → NIXL `UCX` → UCX TCP on `hsn0` |
+## Supported matrix
 
-> [!NOTE]
-> The CXI modes use native libfabric/CXI. The NIXL/UCX mode uses kernel TCP
-> over `hsn0`, not native CXI/RDMA.
+| Tensor path | Ray Object Store | NCCL RDT | NIXL RDT |
+|---|---|---|---|
+| CPU to CPU | HSN/TCP | Unsupported | LIBFABRIC/CXI |
+| GPU to GPU | HSN/TCP with host staging | LIBFABRIC/CXI with PHB GDRDMA | Currently unavailable |
 
-> [!NOTE]
-> Four-device testing did not benefit this single-stream benchmark. NCCL
-> discovered all four devices but continued to transfer only through `cxi3`;
-> NIXL striped across all four but was slower than one rail. The standard
-> matrix therefore uses `cxi3` only. See
-> [Perlmutter transport findings](docs/perlmutter-transport-findings.md#network-device-count-must-be-controlled-explicitly).
+The NIXL 1.3.2 LIBFABRIC topology implementation does not currently expose CXI
+as GPU-capable, so the GPU/NIXL cell is documented as unsupported rather than
+silently falling back to another transport. NCCL does not provide a CPU tensor
+transport.
 
-> [!WARNING]
-> NIXL GPU modes are unavailable in this stack. NIXL's bundled UCX lacks CUDA
-> memory support, while NIXL 1.3.2 LIBFABRIC misclassifies CXI as having no
-> GPUs. See [Perlmutter transport findings](docs/perlmutter-transport-findings.md).
+Ray's control plane uses TCP in every mode. The network labels in the table
+refer to the tensor payload: Object Store payloads use `hsn0`, while NCCL and
+NIXL payloads use native CXI.
 
-## Performance
+## Results
 
-The standard comparison uses three `torch.uint8` payload sizes. A 1 MiB run
-captures small-transfer Ray/transport overhead, not raw NIC latency; 64 MiB
-shows the transition toward bandwidth saturation, and 1 GiB measures bulk
-throughput. Every published value must pass full-payload and transport-evidence
-validation.
+Each flow transferred a 1 GiB tensor. These are the best measured aggregate
+rates within the in-scope single-interface sweeps:
 
-| Mode | Network selection | 1 MiB median ms | 64 MiB median GB/s | 1 GiB median GB/s |
-|---|---|---:|---:|---:|
-| `object` | Provider not asserted | 7.539 | 0.479 | 0.505 |
-| `rdt-tcp` (NCCL) | `hsn0` | 3.975 | 1.808 | 1.952 |
-| `rdt-cxi` (NCCL) | `cxi3` | 4.168 | 9.037 | 17.596 |
-| `rdt-nixl-cxi-cpu` | `cxi3` | 7.586 | 3.684 | 6.009 |
-| `rdt-nixl-ucx-tcp-cpu` | `hsn0` | 7.886 | 1.104 | 1.064 |
+| Tensor | Transport | Best flow count | Median aggregate GB/s |
+|---|---|---:|---:|
+| CPU | Ray Object Store over HSN/TCP | 8 | 1.133 |
+| CPU | NIXL over LIBFABRIC/CXI | 4 | 8.939 |
+| GPU | Ray Object Store with host staging | 8 | 0.888 |
+| GPU | NCCL over aws-ofi-nccl/CXI | 1 | 21.700 |
 
-For bulk transfers, native CXI was the clear winner within each payload
-family: NCCL/CXI reached 17.596 GB/s for CUDA, while NIXL/LIBFABRIC CXI reached
-6.009 GB/s for CPU. The CUDA/NCCL and CPU/NIXL results are separate comparisons
-and should not be treated as a direct backend head-to-head.
+The best multi-rail configurations were:
 
-![Two-node Ray tensor-transfer throughput on Perlmutter, separated into CUDA and CPU payloads](docs/benchmark-throughput.svg)
+| Tensor | Transport | Configuration | Total flows | Median aggregate GB/s |
+|---|---|---|---:|---:|
+| CPU | NIXL, four striped CXI rails | 2 flows per NIC | 8 | 17.272 |
+| GPU | NCCL, four CXI NICs | 1 flow per NIC | 4 | 79.764 |
 
-The machine-readable values and source-log names are in
-[`results/benchmark-results.csv`](results/benchmark-results.csv).
+The main outcomes were:
 
-These 15 validated standard-matrix results were collected across two separate
-two-node Slurm allocations, so normal allocation-to-allocation or node-pair
-variability may be present. NCCL/CXI used `NCCL_NET_GDR_LEVEL=LOC` (host
-staging). `plot_benchmark_results.py` validates the complete matrix and
-generates a two-panel, log-scaled throughput figure at
-`docs/benchmark-throughput.svg`. The tool refuses to publish a partial matrix.
+- NCCL performed best with one flow per NIC. Additional flows on a single NIC
+  reduced aggregate throughput.
+- NCCL reached 79.8 GB/s across four NICs, 3.65x its one-NIC result.
+- NIXL CPU transport reached 8.94 GB/s on one interface and 17.27 GB/s with
+  four-rail striping.
+- Object Store throughput increased with concurrency but was close to its
+  observed maximum by eight flows.
 
-## Build and run
+Object Store stages GPU payloads through host memory, while NCCL uses GDRDMA,
+so their GPU rates do not represent equivalent transfer paths. See the
+[full results, tables, and figures](results.md) or download the
+[machine-readable CSV](results/benchmark-results.csv).
 
-Build the image and select it for subsequent runs:
+## Benchmark design
 
-```bash
-podman-hpc build -t ray-bench-pytorch:26.01.01-nixl1.3.2 -f Containerfile .
-export IMAGE=ray-bench-pytorch:26.01.01-nixl1.3.2
-```
+The complete published matrix contains 32 measured scenarios:
 
-The launcher requires `IMAGE` to be exported and records its value in every
-benchmark log; it does not fall back to the unmodified base image.
+- **Baseline:** one flow at 1 MiB, 64 MiB, and 1 GiB for all four supported
+  transport/device series (12 results).
+- **Single-interface saturation:** Object Store and NCCL use 1, 2, 4, and 8
+  concurrent 1 GiB flows; NIXL uses 1, 2, and 4 (15 results total).
+- **CXI scaling:** NIXL uses 1 and 2 flows per NIC (4 and 8 total logical
+  flows), with every flow natively striped over all four CXI rails. NCCL uses
+  1, 2, and 4 NICs with its independently selected single-NIC operating-point
+  number of flows (5 results total).
 
-Allocate two GPU nodes to run the complete matrix:
+For each single-NIC sweep, the reported operating point is the smallest tested
+flow count whose median throughput is within 95% of that sweep's best result.
+Each NCCL flow has a separate sender, receiver, and two-actor collective group
+and remains limited to one NIC. NCCL multi-NIC throughput therefore comes from
+independent flows. Each NIXL four-rail flow instead has one sender and receiver;
+NIXL divides that logical payload evenly across the four rails. Thus the
+four-rail 1/2-per-NIC cases launch 4/8 sender-receiver pairs and transfer 4/8
+GiB per measured batch.
 
-```bash
-export NERSC_ACCOUNT=<your_gpu_account>
+Every scenario uses three warmups and ten measured batches. Actor creation,
+payload allocation, NIXL initialization, and NCCL collective creation happen
+before the timer. Reported throughput is total bytes completed by all flows
+divided by batch duration. Results include median aggregate GB/s and median and
+nearest-rank p95 latency. Every received tensor is fully verified outside the
+timer. NIXL lazily grows a fixed actor pool and reuses each rail/flow slot for
+the rest of the session. This prevents delayed Ray worker teardown from leaving
+old per-actor CXI registrations alongside the next scenario. The entire pool is
+gracefully terminated after the last NIXL case.
 
-salloc \
-  --nodes=2 \
-  --qos=interactive \
-  --time=01:00:00 \
-  --constraint="gpu&hbm40g" \
-  --account="${NERSC_ACCOUNT}" \
-  --ntasks-per-node=1 \
-  --gpus-per-node=4 \
-  --cpus-per-task=128
-```
+## Build
 
-Run any mode from the table:
+The image adds CuPy and NIXL 1.3.2 to NERSC's PyTorch image:
 
 ```bash
-BENCH=<mode> \
-BENCH_ARGS="--size-mb 1024 --warmup 2 --iterations 7" \
-  ./run_ray_symmetric_bench_interactive.sh
+podman-hpc build -t ray-bench-pytorch:26.01.01-nixl1.3.2 .
 ```
 
-For a quick smoke test first, use
-`BENCH_ARGS="--size-mb 64 --warmup 1 --iterations 2"`.
+The benchmark deliberately uses NERSC's `--nccl-cu13` injection for the
+supported NCCL/libfabric stack. NIXL also uses that option to obtain the Cray
+libfabric and CXI dependencies; it does not use NCCL for its data path.
 
-`rdt-tcp` is always pinned to `hsn0`. Native-CXI runs default to
-`CXI_RAILS=1`, which selects `cxi3`. `CXI_RAILS=4` remains available for
-exploratory diagnostics but is not part of the standard matrix.
-With only `cxi3` exposed, NCCL labels it provider device `/0/`; that local
-index does not mean the transfer used physical device `cxi0`.
+## Run
 
-The `cxi3` default is consistent with Perlmutter's GPU/NIC PCIe affinity.
-NERSC's documented reverse-binding example assigns physical GPU 3 to local
-rank 0; `CUDA_VISIBLE_DEVICES` then presents it as logical `cuda:0`. NCCL
-selected physical `cxi3` for Ray's chosen GPU when all four NICs were visible,
-although the benchmark did not record enough GPU topology data to prove that
-Ray's logical `cuda:0` was physical GPU 3. See
-[Perlmutter transport findings](docs/perlmutter-transport-findings.md#network-device-count-must-be-controlled-explicitly).
-
-Run the official three-size matrix with size-dependent warmups and measured
-iterations:
+Allocate exactly two GPU nodes with all four GPUs visible to the one Slurm task
+on each node. For example:
 
 ```bash
-export NCCL_NET_GDR_LEVEL=LOC
-
-run_case() {
-  local mode="$1"
-  local rails="$2"
-  local size_mib="$3"
-  local warmup="$4"
-  local iterations="$5"
-
-  if [[ -n "${rails}" ]]; then
-    CXI_RAILS="${rails}" \
-    BENCH="${mode}" \
-    BENCH_ARGS="--size-mb ${size_mib} --warmup ${warmup} --iterations ${iterations}" \
-      ./run_ray_symmetric_bench_interactive.sh
-  else
-    BENCH="${mode}" \
-    BENCH_ARGS="--size-mb ${size_mib} --warmup ${warmup} --iterations ${iterations}" \
-      ./run_ray_symmetric_bench_interactive.sh
-  fi
-}
-
-configs=(
-  "object:"
-  "rdt-tcp:"
-  "rdt-cxi:1"
-  "rdt-nixl-cxi-cpu:1"
-  "rdt-nixl-ucx-tcp-cpu:"
-)
-profiles=("1:5:31" "64:3:15" "1024:2:7")
-
-for profile in "${profiles[@]}"; do
-  IFS=: read -r size_mib warmup iterations <<< "${profile}"
-  for config in "${configs[@]}"; do
-    IFS=: read -r mode rails <<< "${config}"
-    run_case "${mode}" "${rails}" "${size_mib}" "${warmup}" "${iterations}"
-  done
-done
+salloc -N 2 -C gpu -q interactive -t 01:30:00 \
+  --ntasks-per-node=1 --cpus-per-task=128 --gpus-per-node=4
 ```
 
-After all runs finish, generate the canonical CSV and SVG inside the benchmark
-image, which already contains Matplotlib:
+### Run one transport
 
 ```bash
-shopt -s nullglob
-logs=("${SCRATCH}"/ray-*-{1,64,1024}MiB-"${SLURM_JOB_ID}".log)
-(( ${#logs[@]} == 15 )) || {
-  echo "ERROR: expected 15 standard-matrix logs, found ${#logs[@]}" >&2
-  false
-}
-
-podman-hpc run --rm --network=none \
-  -v "${PWD}:/workdir" \
-  -v "${SCRATCH}:${SCRATCH}:ro" \
-  -w /workdir \
-  "${IMAGE}" \
-  python -u /workdir/plot_benchmark_results.py \
-    --csv /workdir/results/benchmark-results.csv \
-    --svg /workdir/docs/benchmark-throughput.svg \
-    "${logs[@]}"
+./run_benchmarks.sh --transport object \
+  --image ray-bench-pytorch:26.01.01-nixl1.3.2
+./run_benchmarks.sh --transport nixl --nixl-rails 1 \
+  --image ray-bench-pytorch:26.01.01-nixl1.3.2
+./run_benchmarks.sh --transport nixl --nixl-rails 4 \
+  --image ray-bench-pytorch:26.01.01-nixl1.3.2
+./run_benchmarks.sh --transport nccl --nccl-suite sweep \
+  --image ray-bench-pytorch:26.01.01-nixl1.3.2
 ```
 
-## Reading a result
+Run each command in a fresh allocation. In particular, `--nixl-rails 1` and
+`--nixl-rails 4` are deliberately separate sessions so the single-rail actor
+pool and native four-rail registrations never coexist. The four-rail mode
+automatically uses standard CXI MRs, which are required by the validated native
+striping path. NCCL's sweep and NIC scaling are also separate: read the
+`flows_per_nic` value from the sweep's `OPERATING_POINT`, then use it in a fresh
+allocation:
 
-A successful run ends with three independently useful records:
+```bash
+./run_benchmarks.sh --transport nccl --nccl-suite scaling \
+  --nccl-flows-per-nic <OPERATING_POINT> \
+  --image ray-bench-pytorch:26.01.01-nixl1.3.2
+```
+
+Benchmark runs create raw logs only; publishing is a separate, explicit step.
+
+A quick check of one transport is available with `--smoke`:
+
+```bash
+./run_benchmarks.sh --transport nixl --nixl-rails 1 --smoke \
+  --image ray-bench-pytorch:26.01.01-nixl1.3.2 \
+  --nixl-device cxi3
+```
+
+An independent native-multi-rail probe uses one NIXL agent on each node rather
+than one agent per CXI device. It asks each agent to discover all four devices,
+uses CXI standard MRs directly, raises the DRAM rail-selection bandwidth ceiling
+for the test, transfers and fully verifies one 1 GiB CPU tensor, and then
+requires log evidence that NIXL created four rails, registered memory across
+four rails, and enabled striping:
+
+```bash
+./run_nixl_native_multirail_test.sh \
+  --image ray-bench-pytorch:26.01.01-nixl1.3.2
+```
+
+Run this diagnostic from a fresh allocation. It does not contribute a row to
+the canonical benchmark matrix.
+
+Add `--verbose` to stream complete Ray and library logs. Normally the terminal
+shows only concise `RUN`, `STACK`, `NETWORK`, `PATH`, `AFFINITY`, `RESULT`,
+`OPERATING_POINT`, `ACTOR_POOL`, `ACTOR_CLEANUP`, `ERROR`, `SHUTDOWN`, and
+`ARTIFACT` records. Complete output is retained in a timestamped local
+directory that is ignored by Git.
+
+Ray 2.54 container teardown can be slow and noisy after a clean driver
+shutdown. Podman's `--init` was tested and shortened that teardown, but it also
+propagated Ray's termination statuses as a failed Slurm step. The benchmark
+therefore does not use it; transport success is never inferred from a failed
+launcher status.
+
+## Transport configuration
+
+Object Store sessions receive GPU devices when needed but no CXI devices and
+no `--nccl-cu13` injection. The driver verifies that both Ray node addresses
+match their NERSC `<hostname>-hsn0` address.
+
+The launcher and drivers preserve the measured Perlmutter locality instead of
+relying on Ray's logical CPU count to pin processes. The topology observed on
+both test nodes was:
+
+| Network target | PCI address | NUMA CPUs | Closest GPU |
+|---|---|---|---|
+| `hsn0` / `cxi0` | `0000:c2:00.0` | NUMA 0: `0-15,64-79` | GPU 3, `0000:c1:00.0` |
+| `cxi1` | `0000:81:00.0` | NUMA 1: `16-31,80-95` | GPU 2, `0000:82:00.0` |
+| `cxi2` | `0000:42:00.0` | NUMA 2: `32-47,96-111` | GPU 1, `0000:41:00.0` |
+| `cxi3` | `0000:01:00.0` | NUMA 3: `48-63,112-127` | GPU 0, `0000:03:00.0` |
+
+Every step has one task per node, requests 128 logical CPUs and four GPUs for
+that task, and explicitly sets `--gpu-bind=none`, so each Ray runtime sees all
+four GPUs. For Object Store, a small container entrypoint discovers
+`hsn0` through sysfs, binds the whole Ray process tree to its NUMA CPU set
+before Ray starts, and sets `CUDA_VISIBLE_DEVICES=3`. Linux first-touch memory
+placement is therefore local to NUMA 0. Ray advertises 32 CPUs and one GPU for
+that session. NIXL and NCCL retain all CPUs and GPUs: every NIXL actor discovers its
+selected CXI device through sysfs and pins all existing process threads to
+that device's NUMA CPU set; every NCCL actor additionally resolves its assigned
+GPU PCI address through CUDA and requires its GPU and CXI NUMA nodes to match.
+This is actor-aware, whereas `--gpu-bind=closest` would bind each Slurm task,
+not the individual Ray actors sharing that task.
+
+Each case emits an `AFFINITY` record containing target/GPU PCI addresses, NUMA
+domains, CPU sets, and actor count. The publisher requires complete, consistent
+affinity records and also requires the intended per-session Slurm binding.
+
+NIXL sessions receive `/dev/cxi0` through `/dev/cxi3` plus `/dev/cxi_sbl`.
+For `--nixl-rails 1`, each CPU actor sets `FI_PROVIDER=cxi` and
+`FI_CXI_DEVICE_NAME=cxi3`, then pins its threads to that rail's NUMA CPUs before
+initializing its NIXL agent. For `--nixl-rails 4`, each actor retains the full
+four-NUMA CPU set and initializes one NIXL agent with
+`FI_CXI_DEVICE_NAME=cxi3,cxi2,cxi1,cxi0`; NIXL stripes each payload across those
+four rails. The container retains the mounted CUDA driver needed by `nixl_cu13`,
+but Ray advertises zero GPUs and `CUDA_VISIBLE_DEVICES` is empty so the CPU-only
+NIXL path cannot initialize a GPU communication stack.
+
+The launcher sets `FI_MR_CACHE_MAX_COUNT=1` for NIXL. Ray/NIXL explicitly
+deregisters each receive buffer, but libfabric otherwise caches up to 1024
+deregistered regions by default. Repeated 1 GiB buffers can therefore retain
+CXI page-table resources until an actor exits. A one-entry cache bounds that
+retention per actor while keeping the CXI provider's cached-registration path
+enabled; disabling the cache entirely caused a completed smoke transfer to
+stall before returning to Ray. Reusing a bounded actor pool limits retained
+registrations to the largest requested concurrency instead of accumulating a
+new cache for every case. The driver emits per-case `ACTOR_POOL` evidence and a
+single final `ACTOR_CLEANUP`; the publisher requires both. This is limited to
+NIXL and does not alter the NCCL stack. Run only one NIXL session per allocation
+because final native CXI cleanup can lag Ray's session exit.
+
+The four-rail mode always sets `FI_CXI_OPTIMIZED_MRS=false`: optimized MR
+registration failed before the native striped transfer, while direct standard
+MR registration completed on all four rails. `--nixl-standard-mrs` applies the
+same setting to an optional controlled single-rail comparison. The NIXL `STACK`
+record captures the effective value and rail policy so the results remain
+distinguishable.
+
+NCCL sessions additionally receive `/dev/gdrdrv`. The launcher inherits the
+general NERSC settings from `--nccl-cu13` and adds only the settings that define
+this experiment:
 
 ```text
-RESULT benchmark=rdt-nixl-ucx-tcp-cpu bytes=1073741824 warmup=2 iterations=7 median_ms=1008.753131 median_GBps=1.064425 median_Gbitps=8.515398 transfer_status=pass
-EVIDENCE backend=UCX local=self/memory transport=tcp device=hsn0 status=pass
-SHUTDOWN_STATUS=clean
+NCCL_NET=AWS Libfabric
+NCCL_NET_GDR_READ=1
+NCCL_NETDEVS_POLICY=MAX:1
+FI_PROVIDER=cxi
+FI_CXI_DEVICE_NAME=<actor rail>
 ```
 
-- `RESULT` means the transfer completed, every received byte was verified, and
-  reports median end-to-end latency and effective payload throughput.
-- `EVIDENCE` means the expected backend/provider appeared in the actual
-  transfer log and conflicting fallbacks were absent.
-- `SHUTDOWN_STATUS` distinguishes a valid result from an abnormal Ray exit.
+`--nccl-cu13` already supplies PHB, the HSN bootstrap selection, the memory
+registration configuration, and the injected libraries. The benchmark does
+not set the earlier DMA-BUF or CUDA sync-memops compatibility workarounds; the
+default configuration passed three repeated 1 GiB qualification transfers.
+`/dev/gdrdrv` is the GDRCopy kernel interface; having `libgdrapi.so` without
+that character device is insufficient for the validated PHB path.
 
-Logs are written to `$SCRATCH/ray-<mode>-<size>MiB-<job-id>.log`. CXI log
-names additionally include `-1cxi`; exploratory four-device runs use `-4cxi`,
-so they cannot overwrite standard results. `RAY_BENCH_LOG` and
-`RAY_BENCH_TIMEOUT_SECONDS` override the path and timeout.
+The launcher explicitly removes `FI_CXI_DISABLE_DMABUF_CUDA` and
+`FI_CXI_DISABLE_CUDA_SYNC_MEMOPS` from the container environment before Ray
+starts. The NCCL driver's `STACK` record captures their effective values for
+auditability without treating inherited settings as a driver error.
 
-## Repository layout
+## Publish results
 
-- `run_ray_symmetric_bench_interactive.sh`: Slurm, Podman-HPC, preflight, and
-  transport-evidence orchestration.
-- `ray_*_bench.py` and `benchmark_common.py`: transfer drivers and shared
-  placement, verification, and result logic.
-- `plot_benchmark_results.py` and `results/benchmark-results.csv`: strict log
-  validation, canonical results, and the Matplotlib throughput figure.
-- `Containerfile`: reproducible benchmark image.
+The publisher consumes five locally retained transport logs and requires
+matching images and Ray, PyTorch, and CUDA versions. Its command-line interface
+is documented by `./publish_results.sh --help`.
 
-See [Perlmutter transport findings](docs/perlmutter-transport-findings.md) for
-the Ray/NIXL backend patch, container networking issues, UCX isolation fix,
-and known limitations.
+A successful publication creates:
+
+- [The canonical 32-row CSV](results/benchmark-results.csv)
+- [Payload-size baseline figure](docs/baseline-throughput.svg)
+- [Single-interface flow-scaling figure](docs/single-nic-flow-scaling.svg)
+- [Multi-rail scaling figure](docs/multi-nic-scaling.svg)
+
+The publisher validates every in-scope result and its path, payload, affinity,
+stack, and lifecycle evidence. It renders all four outputs to staging files
+before atomically replacing any canonical artifact, so missing or invalid
+in-scope measurements cannot partially update the published results.
+
+The public CSV contains measurement, configuration, software-version, and
+validation fields, but no local log paths or run-directory identifiers. Raw
+logs and their provenance index remain local and are ignored by Git.
+
+The main implementation is split into one launcher, four transport drivers,
+shared benchmark/statistics code, and one strict result publisher. See the
+[detailed results](results.md) and [previous testing](docs/previous-testing.md)
+for the findings and technical background.
+
+## Local checks
+
+The dependency-free checks can run on a login node with Python 3.11:
+
+```bash
+python3.11 -m unittest -v test_benchmark_tools.py
+python3.11 -m py_compile \
+  benchmark_stats.py benchmark_common.py ray_transfer_bench.py \
+  ray_nccl_bench.py ray_nixl_bench.py ray_nixl_multirail_bench.py \
+  plot_benchmark_results.py
+bash -n run_benchmarks.sh publish_results.sh
+```
 
 ## References
 
-- Ray: [Object Store](https://docs.ray.io/en/latest/ray-core/objects.html) and
-  [Direct Transport](https://docs.ray.io/en/latest/ray-core/direct-transport.html)
-- [NVIDIA Inference Xfer Library (NIXL)](https://github.com/ai-dynamo/nixl)
-- [AWS OFI NCCL plugin](https://github.com/aws/aws-ofi-nccl)
-- [OpenUCX transport and device selection](https://github.com/openucx/ucx/blob/master/docs/source/faq.md#network-capabilities)
-- NCCL 2.29.2: [environment variables](https://docs.nvidia.com/deeplearning/nccl/archives/nccl_2292/user-guide/docs/env.html)
-  and [release notes](https://docs.nvidia.com/deeplearning/nccl/archives/nccl_2307/release-notes/rel_2-29-2.html)
-- NERSC: [Perlmutter architecture](https://docs.nersc.gov/systems/perlmutter/architecture/),
-  [GPU affinity](https://docs.nersc.gov/jobs/affinity/),
-  [CUDA-aware MPI affinity example](https://www.nersc.gov/assets/Uploads/NUGcall_GPUaware_Perlmutter.pdf),
-  and [Podman-HPC](https://docs.nersc.gov/development/containers/podman-hpc/overview/)
-- libfabric 1.22 providers: [CXI](https://ofiwg.github.io/libfabric/v1.22.0/man/fi_cxi.7.html)
-  and [TCP](https://ofiwg.github.io/libfabric/v1.22.0/man/fi_tcp.7.html)
+- [Ray Direct Transport](https://docs.ray.io/en/latest/ray-core/direct-transport.html)
+- [Ray on Slurm](https://docs.ray.io/en/latest/cluster/vms/user-guides/community/slurm.html)
+- [NERSC Perlmutter architecture](https://docs.nersc.gov/systems/perlmutter/architecture/)
+- [NERSC GPU affinity](https://docs.nersc.gov/jobs/affinity/)
+- [AWS OFI NCCL](https://github.com/aws/aws-ofi-nccl)
+- [libfabric CXI provider](https://ofiwg.github.io/libfabric/main/man/fi_cxi.7.html)
+- [NIXL](https://github.com/ai-dynamo/nixl)

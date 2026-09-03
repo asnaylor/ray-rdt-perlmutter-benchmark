@@ -1,6 +1,10 @@
 __pycache__/
 *.py[cod]
 *.log
+logs/
+*.tmp
+/HANDOFF.md
+/LOCAL_RESULTS.md
 local-tests/
 nixl/
 aws-ofi-nccl/

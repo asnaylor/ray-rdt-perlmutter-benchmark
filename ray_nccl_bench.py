@@ -1,62 +1,89 @@
 #!/usr/bin/env python3
-"""Measure one-way Ray Direct Transport transfer over NCCL."""
+"""Benchmark GPU tensors through Ray RDT and NCCL/LIBFABRIC/CXI."""
 
 from __future__ import annotations
 
 import argparse
+import ctypes
 import gc
 import os
-import time
+import stat
 from typing import Any
 
 import ray
 import torch
-from ray.util.scheduling_strategies import NodeAffinitySchedulingStrategy
 
 from benchmark_common import (
-    PAYLOAD_EDGE_CHECKSUM,
-    add_transfer_arguments,
+    BASELINE_SIZES_MIB,
+    CXI_DEVICES,
+    DEFAULT_ITERATIONS,
+    DEFAULT_WARMUPS,
+    FLOW_COUNTS,
+    MIB,
+    actor_affinity,
+    choose_operating_point,
+    cleanup_actors,
+    create_gpu_group,
+    emit_path,
+    emit_result,
+    gpu_actor_options,
     identity,
     make_payload,
-    print_result,
-    print_run,
+    run_batches,
     select_nodes,
     transfer_metadata,
+    validate_and_emit_affinity,
+    validate_hsn0,
     verify_full_payload,
-    verify_placement,
-    verify_transfer_metadata,
 )
 
 
-# Defining tensor-transport actors fails at import time on older Ray builds.
 RDT_API_ERROR: Exception | None = None
 try:
     from ray.experimental.collective import create_collective_group
 
-    @ray.remote(num_cpus=1, num_gpus=1, enable_tensor_transport=True)
+    @ray.remote(enable_tensor_transport=True)
     class Sender:
-        def __init__(self, nbytes: int) -> None:
+        def __init__(self, nbytes: int, rail: str) -> None:
+            os.environ["FI_PROVIDER"] = "cxi"
+            os.environ["FI_CXI_DEVICE_NAME"] = rail
+            self.rail = rail
+            self.affinity = actor_affinity("cxi", rail, "cuda")
             self.payload = make_payload(nbytes, torch.device("cuda"))
 
-        def info(self) -> dict[str, str]:
-            return {**identity(), "device": str(self.payload.device)}
+        def info(self) -> dict[str, Any]:
+            return {
+                **identity(),
+                **self.affinity,
+                "device": "cuda",
+                "rail": self.rail,
+            }
 
         @ray.method(tensor_transport="nccl")
         def send(self) -> torch.Tensor:
             return self.payload
 
 
-    @ray.remote(num_cpus=1, num_gpus=1, enable_tensor_transport=True)
+    @ray.remote(enable_tensor_transport=True)
     class Receiver:
-        def __init__(self) -> None:
+        def __init__(self, rail: str) -> None:
+            os.environ["FI_PROVIDER"] = "cxi"
+            os.environ["FI_CXI_DEVICE_NAME"] = rail
+            self.rail = rail
+            self.affinity = actor_affinity("cxi", rail, "cuda")
             self.payload: torch.Tensor | None = None
 
-        def info(self) -> dict[str, str]:
-            return {**identity(), "device": "cuda"}
+        def info(self) -> dict[str, Any]:
+            return {
+                **identity(),
+                **self.affinity,
+                "device": "cuda",
+                "rail": self.rail,
+            }
 
         def receive(self, payload: torch.Tensor) -> dict[str, Any]:
-            if not payload.is_cuda:
-                raise RuntimeError("receiver got a CPU tensor instead of CUDA")
+            if payload.device.type != "cuda":
+                raise RuntimeError(f"NCCL receiver got {payload.device}")
             self.payload = payload
             return {**identity(), **transfer_metadata(payload)}
 
@@ -77,124 +104,287 @@ except Exception as exc:
 
 
 def parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(
-        description="Benchmark a CUDA tensor through Ray Direct Transport/NCCL"
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument(
+        "--profile", choices=("sweep", "scaling", "smoke"), required=True
     )
-    add_transfer_arguments(parser)
-    return parser.parse_args()
+    parser.add_argument("--flows-per-nic", type=int, choices=FLOW_COUNTS)
+    args = parser.parse_args()
+    if args.profile == "scaling" and args.flows_per_nic is None:
+        parser.error("--profile scaling requires --flows-per-nic")
+    if args.profile != "scaling" and args.flows_per_nic is not None:
+        parser.error("--flows-per-nic is valid only with --profile scaling")
+    return args
+
+
+def require_environment() -> None:
+    if RDT_API_ERROR is not None:
+        raise RuntimeError(f"Ray NCCL RDT API is unavailable: {RDT_API_ERROR}")
+    if not torch.cuda.is_available():
+        raise RuntimeError("Torch cannot access CUDA in this container")
+    try:
+        mode = os.stat("/dev/gdrdrv").st_mode
+    except OSError as exc:
+        raise RuntimeError("/dev/gdrdrv is unavailable inside the container") from exc
+    if not stat.S_ISCHR(mode):
+        raise RuntimeError("/dev/gdrdrv is not a character device")
+    required = {
+        "NCCL_NET": "AWS Libfabric",
+        "NCCL_NET_GDR_LEVEL": "PHB",
+        "NCCL_NET_GDR_READ": "1",
+        "NCCL_NETDEVS_POLICY": "MAX:1",
+        "FI_PROVIDER": "cxi",
+    }
+    for name, expected in required.items():
+        if os.environ.get(name) != expected:
+            raise RuntimeError(
+                f"{name}={os.environ.get(name)!r}; expected {expected!r}"
+            )
+
+
+def environment_setting(name: str) -> str:
+    value = os.environ.get(name)
+    if value is None:
+        return "unset"
+    if not value:
+        return "empty"
+    return value
 
 
 def nccl_version() -> str:
-    try:
-        return str(torch.cuda.nccl.version())
-    except Exception as exc:
-        return f"unavailable ({exc})"
+    value = torch.cuda.nccl.version()
+    if isinstance(value, tuple):
+        return ".".join(str(part) for part in value)
+    return str(value)
 
 
-def require_rdt() -> None:
-    if RDT_API_ERROR is not None:
-        raise RuntimeError(
-            "this image's Ray build lacks the alpha NCCL Ray Direct "
-            "Transport API; choose a newer IMAGE. Original error: "
-            f"{RDT_API_ERROR}"
+def libfabric_version() -> str:
+    library = ctypes.CDLL("libfabric.so.1")
+    library.fi_version.restype = ctypes.c_uint32
+    encoded = int(library.fi_version())
+    return f"{encoded >> 16}.{encoded & 0xffff}"
+
+
+def rails_for_case(nic_count: int, flows_per_nic: int) -> list[str]:
+    return [
+        rail
+        for rail in CXI_DEVICES[:nic_count]
+        for _ in range(flows_per_nic)
+    ]
+
+
+def create_flows(
+    head: dict[str, Any],
+    worker: dict[str, Any],
+    nbytes: int,
+    nic_count: int,
+    flows_per_nic: int,
+) -> tuple[
+    list[Any], list[Any], list[Any], list[Any], list[dict[str, Any]]
+]:
+    assert Sender is not None and Receiver is not None
+    head_group = create_gpu_group(head, nic_count, flows_per_nic)
+    worker_group = create_gpu_group(worker, nic_count, flows_per_nic)
+    senders: list[Any] = []
+    receivers: list[Any] = []
+    for bundle_index, rail in enumerate(CXI_DEVICES[:nic_count]):
+        for _ in range(flows_per_nic):
+            senders.append(
+                Sender.options(
+                    **gpu_actor_options(head_group, bundle_index, flows_per_nic)
+                ).remote(nbytes, rail)
+            )
+            receivers.append(
+                Receiver.options(
+                    **gpu_actor_options(worker_group, bundle_index, flows_per_nic)
+                ).remote(rail)
+            )
+    infos = ray.get([actor.info.remote() for actor in [*senders, *receivers]])
+    expected_rails = rails_for_case(nic_count, flows_per_nic) * 2
+    for info, rail in zip(infos, expected_rails, strict=True):
+        if info["rail"] != rail or not info["accelerator_ids"]:
+            raise RuntimeError("NCCL GPU/rail actor placement is inconsistent")
+    for node_infos in (infos[: len(senders)], infos[len(senders) :]):
+        rail_to_gpu: dict[str, set[str]] = {}
+        for info in node_infos:
+            rail_to_gpu.setdefault(info["rail"], set()).update(
+                str(item) for item in info["accelerator_ids"]
+            )
+        if any(len(gpus) != 1 for gpus in rail_to_gpu.values()):
+            raise RuntimeError("flows for one NCCL rail do not share one GPU")
+        selected_gpus = {next(iter(gpus)) for gpus in rail_to_gpu.values()}
+        if len(selected_gpus) != nic_count:
+            raise RuntimeError("different NCCL rails were not assigned distinct GPUs")
+    collective_groups = []
+    for sender, receiver in zip(senders, receivers, strict=True):
+        collective_groups.append(
+            create_collective_group([sender, receiver], backend="nccl")
         )
-    if not torch.cuda.is_available():
-        raise RuntimeError("Torch cannot access CUDA in this container")
-    if nccl_version().startswith("unavailable"):
-        raise RuntimeError(f"Torch NCCL support is {nccl_version()}")
+    return (
+        senders,
+        receivers,
+        [head_group, worker_group],
+        collective_groups,
+        infos,
+    )
 
 
-def benchmark(args: argparse.Namespace) -> None:
-    benchmark_mode = os.environ.get("RAY_BENCH_MODE", "rdt")
-    print(f"Ray NCCL Direct Transport benchmark ({benchmark_mode})", flush=True)
+def run_case(
+    head: dict[str, Any],
+    worker: dict[str, Any],
+    suite: str,
+    size_mib: int,
+    nic_count: int,
+    flows_per_nic: int,
+    warmups: int,
+    iterations: int,
+) -> Any:
+    total_flows = nic_count * flows_per_nic
+    case_id = (
+        f"nccl-gpu-{suite}-{size_mib}mib-{nic_count}n-"
+        f"{flows_per_nic}fpn"
+    )
     print(
-        f"Ray: {ray.__version__}; Torch: {torch.__version__}; "
-        f"CUDA: {torch.version.cuda}; NCCL: {nccl_version()}",
+        f"RUN case={case_id} suite={suite} transport=nccl device=gpu "
+        f"size_mib={size_mib} nic_count={nic_count} "
+        f"flows_per_nic={flows_per_nic} total_flows={total_flows}",
         flush=True,
     )
-    require_rdt()
-
-    initialized = False
+    emit_path(
+        case_id,
+        "nccl",
+        "gpu",
+        "cxi",
+        "aws-ofi-nccl",
+        nic_count,
+        CXI_DEVICES[:nic_count],
+        gdr_level="PHB",
+        gdr_read=1,
+        netdevs_policy="MAX:1",
+        ray_control="hsn0",
+    )
+    senders: list[Any] = []
+    receivers: list[Any] = []
+    groups: list[Any] = []
+    collective_groups: list[Any] = []
     try:
-        ray.init(address="auto")
-        initialized = True
-        head, worker = select_nodes()
-        nbytes = args.size_mb * 1024 * 1024
-        assert Sender is not None and Receiver is not None
-        sender = Sender.options(
-            scheduling_strategy=NodeAffinitySchedulingStrategy(
-                node_id=head["NodeID"], soft=False
-            )
-        ).remote(nbytes)
-        receiver = Receiver.options(
-            scheduling_strategy=NodeAffinitySchedulingStrategy(
-                node_id=worker["NodeID"], soft=False
-            )
-        ).remote()
-
-        sender_info, receiver_info = ray.get(
-            [sender.info.remote(), receiver.info.remote()]
+        (
+            senders,
+            receivers,
+            groups,
+            collective_groups,
+            affinity_infos,
+        ) = create_flows(
+            head, worker, size_mib * MIB, nic_count, flows_per_nic
         )
-        verify_placement(sender_info, str(head["NodeID"]), "sender")
-        verify_placement(receiver_info, str(worker["NodeID"]), "receiver")
-        if sender_info["hostname"] == receiver_info["hostname"]:
-            raise RuntimeError("sender and receiver unexpectedly share a hostname")
-
-        try:
-            group = create_collective_group([sender, receiver], backend="nccl")
-        except Exception as exc:
-            raise RuntimeError(
-                "could not create the NCCL RDT collective; verify the IMAGE "
-                f"and NCCL configuration: {exc}"
-            ) from exc
-
-        print(
-            f"Source: {sender_info['hostname']} ({sender_info['node_id']}), "
-            f"device={sender_info['device']}",
-            flush=True,
+        validate_and_emit_affinity(
+            case_id,
+            "nccl",
+            "gpu",
+            affinity_infos,
+            rails_for_case(nic_count, flows_per_nic),
         )
-        print(
-            f"Destination: {receiver_info['hostname']} "
-            f"({receiver_info['node_id']}), device={receiver_info['device']}",
-            flush=True,
+        measured = run_batches(
+            senders,
+            receivers,
+            size_mib * MIB,
+            "cuda",
+            warmups,
+            iterations,
         )
-        print(
-            f"Payload: {nbytes} bytes ({args.size_mb} MiB); "
-            f"expected edge checksum: {PAYLOAD_EDGE_CHECKSUM}",
-            flush=True,
+        emit_result(
+            case_id,
+            suite,
+            "nccl",
+            "gpu",
+            size_mib,
+            nic_count,
+            flows_per_nic,
+            total_flows,
+            warmups,
+            iterations,
+            measured,
         )
-
-        rates: list[float] = []
-        durations: list[float] = []
-        for run in range(args.warmup + args.iterations):
-            start = time.perf_counter()
-            tensor_ref = sender.send.remote()
-            result_ref = receiver.receive.remote(tensor_ref)
-            result = ray.get(result_ref)
-            seconds = time.perf_counter() - start
-            verify_transfer_metadata(result, nbytes, "cuda")
-
-            verification = ray.get(receiver.verify_and_release.remote(nbytes))
-            if not verification["verified"]:
-                raise RuntimeError("receiver did not verify the complete payload")
-            del tensor_ref, result_ref
-            gc.collect()
-
-            rate = print_run(run, args.warmup, seconds, result["nbytes"])
-            if rate is not None:
-                rates.append(rate)
-                durations.append(seconds)
-
-        print_result(benchmark_mode, nbytes, rates, durations, args.warmup)
-        del group
+        return measured
     finally:
-        if initialized:
-            ray.shutdown()
-            print("DRIVER_SHUTDOWN_STATUS=clean", flush=True)
+        collective_groups.clear()
+        cleanup_actors([*senders, *receivers], groups)
+
+
+def benchmark(profile: str, scaling_flows_per_nic: int | None = None) -> None:
+    require_environment()
+    print(
+        f"STACK transport=nccl ray={ray.__version__} torch={torch.__version__} "
+        f"cuda={torch.version.cuda} nccl={nccl_version()} "
+        f"libfabric={libfabric_version()} "
+        "disable_dmabuf_cuda="
+        f"{environment_setting('FI_CXI_DISABLE_DMABUF_CUDA')} "
+        "disable_cuda_sync_memops="
+        f"{environment_setting('FI_CXI_DISABLE_CUDA_SYNC_MEMOPS')}",
+        flush=True,
+    )
+    ray.init(address="auto")
+    try:
+        head, worker = select_nodes()
+        validate_hsn0(head, worker)
+        if profile == "smoke":
+            run_case(head, worker, "smoke", 1, 1, 1, 1, 1)
+            return
+
+        if profile == "sweep":
+            for size_mib in BASELINE_SIZES_MIB:
+                run_case(
+                    head,
+                    worker,
+                    "baseline",
+                    size_mib,
+                    1,
+                    1,
+                    DEFAULT_WARMUPS,
+                    DEFAULT_ITERATIONS,
+                )
+            flow_results = {
+                flows: run_case(
+                    head,
+                    worker,
+                    "single-nic",
+                    1024,
+                    1,
+                    flows,
+                    DEFAULT_WARMUPS,
+                    DEFAULT_ITERATIONS,
+                )
+                for flows in FLOW_COUNTS
+            }
+            operating_point = choose_operating_point(flow_results)
+            print(
+                f"OPERATING_POINT transport=nccl device=gpu "
+                f"flows_per_nic={operating_point} criterion=95pct_of_sweep_max",
+                flush=True,
+            )
+            return
+
+        if profile != "scaling" or scaling_flows_per_nic not in FLOW_COUNTS:
+            raise RuntimeError("invalid NCCL benchmark profile or flow count")
+        for nic_count in (1, 2, 4):
+            run_case(
+                head,
+                worker,
+                "multi-nic",
+                1024,
+                nic_count,
+                scaling_flows_per_nic,
+                DEFAULT_WARMUPS,
+                DEFAULT_ITERATIONS,
+            )
+    finally:
+        ray.shutdown()
+        print("SHUTDOWN status=clean transport=nccl", flush=True)
 
 
 if __name__ == "__main__":
     try:
-        benchmark(parse_args())
+        arguments = parse_args()
+        benchmark(arguments.profile, arguments.flows_per_nic)
     except RuntimeError as exc:
         raise SystemExit(f"ERROR: {exc}") from exc
